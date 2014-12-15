@@ -26,18 +26,19 @@
   be in an inconsistant state.
 */
 
-// since we'll be at version 0 by default, we should have a migration set for
-// it.
-var DefaultMigration = {version: 0, up: function(){}};
 
 Migrations = {
-  _list: [DefaultMigration],
-}
-
-// collection holding the control record
-Migrations._collection = new Meteor.Collection('migrations');
+  _list : []
+};
 
 Meteor.startup(function () {
+  //Always try to add our default Migration of version 0.
+  var DefaultMigration = {version: 0, description:'Initial Version', up: function(){}};
+  var defaultLog = MigrationLogs.findOne({_id:'_current'});
+  if (!defaultLog) {
+    MigrationLogs.insert({_id: '_current', logs: []});
+  }
+  Migrations.add(DefaultMigration);
   if (process.env.MIGRATE)
     Migrations.migrateTo(process.env.MIGRATE);
 });
@@ -55,12 +56,19 @@ Migrations.add = function(migration) {
   if (typeof migration.version !== 'number')
     throw new Meteor.Error('Migration must supply a version number.');
 
-  if (migration.version <= 0)
+  if (typeof migration.description !== 'string')
+    throw new Meteor.Error('Migration must supply a description.');
+
+  if (migration.version < 0)
     throw new Meteor.Error('Migration version must be greater than 0');
 
+  if (_.indexOf(_.map(Migrations._list, function(migration) {return migration.version}), migration.version) > -1)
+    throw new Meteor.Error('Only one migration is allowed per version number');
+
   this._list.push(migration);
+  MigrationVersions.upsert({version: migration.version}, {version:migration.version, description:migration.description});
   this._list = _.sortBy(this._list, function(m) {return m.version;});
-}
+};
 
 // Attempts to run the migrations using command in the form of:
 // e.g 'latest', 'latest,exit', 2
@@ -85,35 +93,42 @@ Migrations.migrateTo = function(command) {
   // remember to run meteor with --once otherwise it will restart
   if (subcommand === 'exit')
     process.exit(0); 
-}
+};
 
 // just returns the current version
 Migrations.getVersion = function() {
   return this._getControl().version;
-}
+};
+
+Migrations.log = function(text) {
+  MigrationLogs.update({_id:'_current'}, {$push: {logs: {datetime: new Date(), line: text}}});
+  console.log(text);
+};
 
 // migrates to the specific version passed in
 Migrations._migrateTo = function(version, rerun) {
   var self = this;
   var control = this._getControl();
   var currentVersion = control.version;
+  var startVersion = currentVersion;
+  MigrationLogs.update( {_id: '_current'}, {$set: {logs: []}} );
 
   if (rerun) {
-    console.log('Rerunning version ' + version);
+    Migrations.log('Rerunning version ' + version);
     setLocked(true);
     migrate('up', version);
     setLocked(false);
-    console.log('Finished migrating.');
+    Migrations.log('Finished migrating.');
     return;
   }
 
   if (currentVersion === version) {
-    console.log('Not migrating, already at version ' + version);
+    Migrations.log('Not migrating, already at version ' + version);
     return;
   }
 
   if (control.locked) {
-    console.log('Not migrating, control is locked.');
+    Migrations.log('Not migrating, control is locked.');
     return;
   }
 
@@ -121,7 +136,7 @@ Migrations._migrateTo = function(version, rerun) {
   var endIdx = this._findIndexByVersion(version);
 
   // console.log('startIdx:' + startIdx + ' endIdx:' + endIdx);
-  console.log('Migrating from version ' + this._list[startIdx].version
+  Migrations.log('Migrating from version ' + this._list[startIdx].version
     + ' -> ' + this._list[endIdx].version);
 
   // run the actual migration
@@ -137,9 +152,9 @@ Migrations._migrateTo = function(version, rerun) {
       return migration.name ? ' (' + migration.name + ')' : '';
     }
 
-    console.log('Running ' + direction + '() on version ' 
-      + migration.version + maybeName());
+    Migrations.log('Running ' + direction + '() on version ' + migration.version + maybeName());
     migration[direction].call();
+
   }
 
   // sets the current version to be locked/unlocked
@@ -161,16 +176,27 @@ Migrations._migrateTo = function(version, rerun) {
       setLocked(true);
     }
   }
+  Migrations.log('Finished migration.');
+
+  var currentLog = MigrationLogs.findOne({_id:'_current'});
+  var history = {
+    datetime: new Date(),
+    logs: currentLog.logs,
+    startVersion: startVersion,
+    targetVersion: version,
+    endingVersion: currentVersion,
+    rerun: !!rerun
+  };
+
+  MigrationLogs.insert(history);
   setLocked(false);
-  console.log('Finished migrating.');
-}
+};
 
 // gets the current control record, optionally creating it if non-existant
 Migrations._getControl = function() {  
-  var control = this._collection.findOne({_id: 'control'});
-
+  var control = MigrationVersions.findOne({_id: 'control'});
   return control || this._setControl({version: 0, locked: false});
-}
+};
 
 // sets the control record
 Migrations._setControl = function(control) {
@@ -178,11 +204,11 @@ Migrations._setControl = function(control) {
   check(control.version, Number);
   check(control.locked, Boolean);
 
-  this._collection.update({_id: 'control'}, 
+  MigrationVersions.update({_id: 'control'},
     {$set: {version: control.version, locked: control.locked}}, {upsert: true});
 
   return control;
-}
+};
 
 // returns the migration index in _list or throws if not found
 Migrations._findIndexByVersion = function(version) {
@@ -192,10 +218,10 @@ Migrations._findIndexByVersion = function(version) {
   }
 
   throw new Meteor.Error('Can\'t find migration version ' + version);
-}
+};
 
 //reset (mainly intended for tests)
 Migrations._reset = function() {
   this._list = [{version: 0, up: function(){}}];
-  this._collection.remove({});
-}
+  MigrationVersions.remove({});
+};
